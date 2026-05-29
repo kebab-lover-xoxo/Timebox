@@ -77,6 +77,66 @@
 
 -----
 
+## Vault
+
+> Secrets management. Lease-based rotation. No secret lives forever. All services pull credentials at startup, not from env files.
+
+- Self-hosted HashiCorp Vault in `infra` namespace, HA mode with Raft storage
+- All DB passwords, API keys, and tokens issued as leases with TTL — auto-rotated on expiry
+- Services use Vault Agent sidecar — injects secrets as environment variables at pod start
+- External Secrets Operator syncs Vault secrets into K8s Secrets for Helm compatibility
+- Dynamic secrets for PostgreSQL: Vault generates a unique DB user per pod on startup, revokes on shutdown
+- Audit log enabled — every secret access logged to Loki
+- **Constraint:** No static long-lived secrets anywhere in the cluster — lease TTL enforced
+- **Constraint:** Vault seal key never stored in cluster — unsealed via cloud KMS (AWS KMS / GCP CKMS)
+- **Constraint:** Secret access logged with `trace_id` — every credential use is attributable
+
+-----
+
+## Linkerd (mTLS)
+
+> Service mesh. Encrypts all pod-to-pod traffic. Mutual TLS enforced inside cluster. Compromised pod cannot sniff peers.
+
+- Linkerd installed in `infra` namespace — lightweight, Rust data plane, < 10ms latency overhead
+- mTLS automatic for all meshed pods — no application code changes required
+- Traffic policy: deny by default, explicit allow per service pair via `AuthorizationPolicy`
+- Observability: Linkerd Viz exposes golden metrics (success rate, RPS, latency) per route — feeds Prometheus
+- Tap: live traffic inspection per pod for debugging — requires RBAC, disabled in prod by default
+- **Constraint:** All application pods annotated `linkerd.io/inject: enabled` — no unmeshed pods in prod
+- **Constraint:** `AuthorizationPolicy` required for every cross-service route — no implicit allow
+- **Constraint:** Linkerd control plane certificates rotated automatically via cert-manager
+
+-----
+
+## Falco
+
+> Runtime container security. Watches syscalls inside running pods. Detects anomalous behavior post-deploy.
+
+- Deployed as DaemonSet in `infra` namespace — one Falco pod per node
+- Rules: shell spawn inside container, unexpected outbound connection, privilege escalation attempt, `/etc/passwd` read, unexpected file write to sensitive paths
+- Alerts routed to Alertmanager → Slack (warning) / PagerDuty (critical)
+- Custom rules added for application-specific anomalies: unexpected Postgres connection from non-API pod, Redis access from outside allowed services
+- FalcoSidekick forwards events to Loki for correlation with application logs via `trace_id`
+- **Constraint:** Default ruleset enabled plus custom rules — no Falco with empty ruleset
+- **Constraint:** Falco alerts treated as incident triggers — every alert has a runbook (see IR Playbook)
+- **Constraint:** Rule changes version-controlled and reviewed — no ad hoc rule edits in prod
+
+-----
+
+## kube-bench
+
+> CIS Kubernetes Benchmark scanner. Audits cluster configuration against hardening standard. Runs on schedule.
+
+- Runs as a Job in `infra` namespace on weekly schedule via `pg_cron` equivalent (K8s CronJob)
+- Checks: API server flags, etcd security, kubelet config, RBAC posture, network policies, pod security standards
+- Results stored as K8s ConfigMap and forwarded to Loki
+- Failures above threshold trigger Alertmanager warning
+- **Constraint:** Run after every k3s version upgrade — not just on schedule
+- **Constraint:** FAIL results on critical checks block next prod deploy via CI gate
+- **Constraint:** Benchmark results reviewed in post-mortem if a security incident occurs
+
+-----
+
 ## Ollama
 
 > Local LLM runtime. Developer machine only. Managed via CLI. Never in prod cluster.
@@ -87,7 +147,6 @@
 - LLM service points to Ollama base URL in local env — zero code difference from prod
 - **Constraint:** Never runs inside k3s in prod — vLLM only on GPU nodes
 - **Constraint:** No model names hardcoded — always read from config
-  > May Need To be Reviewed becuase anyone who has the codebase should be able to tether
 
 -----
 
@@ -224,9 +283,25 @@
 - **Constraint:** No provider-specific code outside `providers/` directory
 - **Constraint:** Prompt content never logged — only SHA-256 hash stored in `ai_sessions`
 - **Constraint:** Provider interface only import in routers — abstraction never bypassed
-- **Constraint:** Prompt injection middleware: strip control chars, enforce max tokens before forwarding
+- **Constraint:** All prompts pass through `PromptSanitiser` middleware before forwarding — no bypass
 
 > **Python libs:** `httpx` (async HTTP to Ollama/vLLM), `tiktoken` (token counting)
+
+-----
+
+## Prompt Injection Middleware
+
+> Sanitisation layer between user input and LLM. Runs before every inference request. No prompt reaches the model without passing this.
+
+- Implemented as FastAPI middleware in `llm-service/middleware/prompt_sanitiser.py`
+- Strip control characters: `\x00`–`\x1F` except `\n`, `\t` — removes jailbreak escape sequences
+- Enforce max token count: `tiktoken` encodes prompt, rejects if over configured limit (default 4096 tokens)
+- Pattern detection: regex patterns for known injection signatures (`ignore previous instructions`, `you are now`, `system:`) — configurable blocklist in `config.yaml`
+- System prompt isolation: user input never concatenated directly with system prompt — always inserted into a typed message structure
+- Injection attempts logged as security events to Loki with `trace_id` and user_id — never the prompt content
+- **Constraint:** Middleware runs before provider dispatch — cannot be short-circuited by route handlers
+- **Constraint:** Pattern blocklist version-controlled — changes require PR review
+- **Constraint:** Failed sanitisation returns `400` with generic message — no hint about which rule triggered
 
 -----
 
@@ -236,11 +311,13 @@
 
 - FastAPI: `@app.websocket("/ws/{type}/{id}")` — one handler per connection type
 - Auth: JWT query param on handshake — validated before upgrade completes, rejected if invalid
-- Token re-validation on each message — long-lived connections cannot outlive token TTL
+- Token re-validation on each inbound message — JWT claims checked against Redis session store
+- Explicit re-auth frame: when access token TTL expires mid-connection, server sends `auth_required` frame — client must send fresh token within 30s or connection is closed
 - Connection registry in Redis — tracks active connections for fan-out
 - Graceful close: server sends close frame, client reconnects with exponential backoff
 - Application-layer message rate limiting via Redis counter per connection
 - **Constraint:** No unauthenticated connections — reject before upgrade
+- **Constraint:** Re-auth frame mandatory on token expiry — no grace period for stale tokens on long sessions
 - **Constraint:** Message size limit enforced server-side — disconnect on oversized frame (DoS)
 - **Constraint:** All WS payloads typed with Pydantic models — no raw JSON blobs
 
@@ -334,6 +411,22 @@
 
 -----
 
+## pip-licenses / license-checker
+
+> Dependency licence scan. Python and Node. GPL contamination caught before it ships.
+
+- `pip-licenses --format=json` on all Python environments — outputs licence per package
+- `license-checker --json` on all Node `package.json` files
+- Blocklist: `GPL-2.0`, `GPL-3.0`, `AGPL-3.0`, `LGPL-2.1` — configurable per project
+- Allowlist: `MIT`, `Apache-2.0`, `BSD-2-Clause`, `BSD-3-Clause`, `ISC`, `0BSD`
+- Licence report stored as CI artefact per run — queryable for compliance audit
+- Pipeline fails on any package matching blocklist
+- **Constraint:** Runs after pip-audit / npm audit — same stage, no additional overhead
+- **Constraint:** Licence blocklist version-controlled — changes require legal review comment in PR
+- **Constraint:** New dependencies reviewed for licence before merge — automated gate is a safety net, not a substitute
+
+-----
+
 ## Docker Build
 
 > Multi-stage. Non-root user. Minimal prod image. Tagged by git SHA. No latest, ever.
@@ -347,14 +440,29 @@
 
 -----
 
+## syft (SBOM)
+
+> Software Bill of Materials. Generated from every Docker image after build. Inventory of what ships.
+
+- `syft` runs on every built image — outputs SBOM in SPDX and CycloneDX formats
+- SBOM stored as CI artefact alongside image SHA — permanent audit record
+- Enables rapid response to zero-days: query SBOM to find which images contain a vulnerable package without rebuilding
+- SBOM uploaded to container registry as image attestation — verifiable at deploy time
+- **Constraint:** SBOM generation is a required CI step — build without SBOM does not push to registry
+- **Constraint:** SBOM format: both SPDX (tooling compatibility) and CycloneDX (Dependency-Track ingestion)
+- **Constraint:** SBOM retained for the lifetime of the image — not pruned when image is pruned
+
+-----
+
 ## Container Registry
 
 > Image storage. SHA-tagged. Helm values reference explicit tag per environment.
 
-- Images pushed only after all gates pass
+- Images pushed only after all gates pass — SBOM attestation attached at push time
 - Tags: `{service}:{git-sha}` — no latest, no semver
 - Helm `values.yaml` per env references explicit SHA
-- **Constraint:** Old images pruned on schedule
+- Registry scanning enabled — secondary CVE pass on stored images
+- **Constraint:** Old images pruned on schedule — SBOM retained separately before prune
 - **Constraint:** Pull secrets in K8s Secrets — never in Helm values files
 
 -----
@@ -381,8 +489,26 @@
 - `prometheus-fastapi-instrumentator` auto-instruments all FastAPI services
 - SLOs alerted: API p99 > 500ms, error rate > 0.1%, LLM p95 > 30s, MC run > 60s
 - Alertmanager: Slack (warning), PagerDuty (critical)
+- Linkerd Viz metrics ingested alongside application metrics — golden signals per service route
+- Falco alert events forwarded to Alertmanager — runtime security on same paging path as SLO breaches
 - **Constraint:** No alert without a runbook link
 - **Constraint:** Dashboards in version control — never clicked together in UI
+
+-----
+
+## OWASP ZAP (DAST)
+
+> Dynamic application security testing. Runs against live staging after every deploy. Finds runtime issues SAST cannot.
+
+- OWASP ZAP runs as a GitHub Actions step after `deploy-staging` completes
+- Passive scan: crawls all API routes, flags information leakage, missing headers, insecure cookies
+- Active scan: targeted attack simulation on authenticated endpoints — SQL injection, XSS, path traversal
+- Auth: ZAP configured with a test-user JWT — scans authenticated routes, not just public surface
+- Results stored as CI artefact (HTML + JSON report) per run
+- Pipeline fails if any HIGH or CRITICAL finding is new — existing known findings suppressed via `.zap/false-positives.yaml`
+- **Constraint:** ZAP runs against staging only — never prod
+- **Constraint:** New HIGH/CRITICAL findings block deploy-prod gate — must be triaged before promotion
+- **Constraint:** False-positive suppression file version-controlled — no silent ignores without PR review
 
 -----
 
@@ -393,8 +519,24 @@
 - Promtail daemonset scrapes all pod logs automatically
 - Required fields: `timestamp`, `level`, `service`, `trace_id`, `message`
 - Retention: 30 days hot, 90 days cold on S3
+- Falco events and Vault audit logs ingested into Loki alongside application logs
 - **Constraint:** No PII in logs — user IDs only, never email, name, payload
 - **Constraint:** `trace_id` mandatory — logs without it alerted as misconfigured
+
+-----
+
+## S3 Backup Encryption
+
+> All backups encrypted at rest. SSE-KMS on backup bucket. Restore drill on schedule.
+
+- Dedicated S3 bucket for PostgreSQL daily snapshots — SSE-KMS encryption, AWS KMS or GCP CKMS
+- Bucket policy: no public access, no cross-account access without explicit policy
+- Versioning enabled — accidental overwrite recoverable
+- Lifecycle policy: 14 days standard storage (aligned to retention window), then deleted — no indefinite backup accumulation
+- Monthly restore drill: automated job restores latest backup to isolated RDS instance, runs schema validation, reports success/failure to Slack
+- **Constraint:** Backup bucket never accessible from application pods — separate IAM role, separate credentials
+- **Constraint:** KMS key rotation enabled — annual automatic rotation
+- **Constraint:** Restore drill failure triggers PagerDuty alert — backup that cannot restore is not a backup
 
 -----
 
@@ -408,6 +550,27 @@
 - `before_send` strips sensitive fields before transmission
 - **Constraint:** DSN in K8s Secret / env var — never in source code
 - **Constraint:** No passwords, tokens, or PII in payloads — scrubbing configured and tested
+
+-----
+
+## Incident Response Playbook
+
+> Defined response process for every alert. Detection to post-mortem. No on-call engineer improvises.
+
+- Every Alertmanager rule links to a runbook in `docs/runbooks/` — version-controlled, reviewed quarterly
+- IR phases:
+1. **Detection** — alert fires, on-call paged via PagerDuty, acknowledge within 5 min
+1. **Triage** — severity assessed: P1 (service down), P2 (degraded), P3 (non-user-facing)
+1. **Containment** — isolate affected pod/service: scale to 0, network policy block, or rollback via Helm
+1. **Eradication** — root cause identified, fix applied to staging, gates pass
+1. **Recovery** — deploy fix to prod, verify SLOs restored, monitor for 30 min
+1. **Post-mortem** — blameless, written within 48 hours, action items tracked in issues
+- Falco triggers: immediate containment — affected pod isolated, network policy applied, security team notified
+- Vault breach: all leases revoked immediately, dynamic secrets rotated, audit log pulled
+- Data breach protocol: legal notified within 24 hours, users notified per jurisdiction requirements
+- **Constraint:** Every runbook tested in tabletop exercise quarterly
+- **Constraint:** Post-mortem action items tracked to completion — no open items > 30 days
+- **Constraint:** IR playbook itself reviewed after every P1 incident — process improves with each event
 
 -----
 
@@ -506,3 +669,28 @@
 - **Constraint:** Purge job monitored via Prometheus job metric — failure alerts on-call
 
 -----
+
+## DevSecOps & OpSec Gap Analysis
+
+### Covered
+
+|Area                  |Implementation                              |
+|----------------------|--------------------------------------------|
+|SAST                  |SonarQube + Ruff + mypy                     |
+|Container scan (build)|Trivy                                       |
+|Dependency CVEs       |pip-audit + npm audit                       |
+|Secrets detection     |Gitleaks (CI + pre-commit)                  |
+|Supply chain          |Pinned action SHAs                          |
+|Auth (HTTP)           |JWT short TTL + rotating refresh            |
+|Auth (WebSocket)      |JWT on handshake + per-message re-validation|
+|Rate limiting (HTTP)  |Nginx                                       |
+|Rate limiting (WS)    |Redis app-layer counter                     |
+|Input validation      |Pydantic v2 strict + Zod                    |
+|SQL injection         |ORM + parameterised queries only            |
+|Client crypto         |ECDH + PBKDF2 + ML-KEM + AES-256-GCM        |
+|PII in logs           |Structured logs, no PII policy              |
+|Prompt privacy        |Prompt hash only, never stored raw          |
+
+### Coverage Summary
+
+All previously identified air gaps are now first-class sections in this document.
